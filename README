@@ -1,0 +1,187 @@
+grain
+
+* Intro
+
+What does each row in a dataset represent? Is each row an employee,
+and every employee has only one row? Or does each employee have twelve
+rows, one for each month, but some combinations are missing? Are there
+duplicate rows?
+
+These are questions of grain, and the grain tells you what operations
+you can do and what data might be missing. Is it proper to sum on
+employee ID? Is one of the dates missing half of the employees?
+
+To work with a dataset grain:
+
+  g = GrainDf(df)
+
+* 1. Identifying grain
+
+Identifying a single column or combination of columns is part of
+understanding the grain of a dataset.
+
+g.columns
+
+  column(s) that describe the grain of the dataset
+
+g.unique
+
+  True/False, can rows be uniquely identified
+
+g.unique_rate
+
+  percent of rows that can be uniquely identified using the grain
+  columns
+
+g.duplicate_ids
+
+  if there are duplicates, report the ID values that have duplicate
+  rows
+
+g.duplicate_rows
+
+  if there are duplicates, return the full rows, sorted by ID value
+
+* 2. Multi-column grains
+
+g.contrib
+
+  When grain is two or more columns, contrib shows how much each
+  column contributes to uniquely identifying each row.
+
+  If an employee dataset is almost entirely unique
+  employee_ids, which only a few employee_ids having multiple records
+  with different 'status' values, then employee_id might have 99%
+  strength and 'status' is 1%.
+
+  If a dataset consists of paychecks issued across 50 weeks, with each
+  week having 100 records for 100 unique employees, then 'week' has
+  33% strength and 'employee_id' has 66% strength.
+
+  See documentation of g.contrib for technical details.
+
+g.col_rels()
+
+  Describes how values in one ID column relate to values in another ID
+  column, namely if there are 1:many or many:many.
+
+g.perfect
+
+  True/False
+
+  If multiple columns uniquely identify a dataset, the dataset is
+  perfectly crossed if it has every possible combination of values in
+  those columns.
+
+  In a paycheck dataset, if every 'pay_date' has every 'employee_id'
+  (and therefore every 'employee_id' has every 'pay_date'?), the
+  dataset is perfect. If instead there are 500 possible combinations
+  (e.g. 50 'weeks' and 10 'employees'), and 5 of those combinations
+  are not found in the dataset, the dataset is 99% perfect.
+
+g.missing_rate
+
+  Given the total number of all possible value combinatinos, how many
+  of those combinations are not in the dataset.
+
+g.missing_rows
+
+  This returns the ID value combinations which are not found in the
+  dataset.
+
+g.col_rels()
+
+  For each pair of grain columns, identify if they are 1:1, 1:many, or
+  many:many. 
+
+* 3. Filter up
+
+Imagine we have a dataset of checks issued to employees, which is
+mostly the same 10 employees each week. However, some employees get
+multiple checks in a week, and there's a 'check_type' column with
+values of 'salary' and 'reimbursement'. To uniquely identify rows, you
+use the combination of 'employee_id', 'date' and 'check_type'.
+
+Who are the employees that receive reimbursement checks? Are they also
+receiving salary checks?
+
+The steps to answer this question:
+  1. filter to employee ids that have rows with 'chech_type'='reimburse'
+  2. join that employee id list back to original dataset
+  3. show all checks (reimb+salary, if present) for those employees
+
+The above is automated in this call:
+
+  g = GrainDf(paychecks)
+  g.check_type.filter_up('reimbursement')
+
+This will show employees that received reimbursement checks, as well
+as the other check types they received in those pay periods. If you
+don't want to limit the results by pay_periods, add the also_above
+argument:
+
+  g.check_type.filter_up('reimbursement', also_above='pay_period')
+
+* Appendix: Measures of uniqueness
+
+** option 1 - coverage rate / diversity rate / strengh
+# of unique values / # of rows
+
+  never 0, which I don't like
+
+  = 1 - duplicated() / shape[0 ]
+  = unique() / shape[0 ]
+
+		#1	#2
+  aaaaabbbbb	0.2	0
+  aaabbbccc	0.3	0
+  aabbccddee	0.5	0
+
+  aaaaaaaaab	0.2	0.1
+  aaaaaaaabc	0.3	0.2
+  aaaaaaabcd	0.4	0.3
+
+  this is a good measure of a single field within a multi-field
+  grain. It's not telling you how many rows you can uniquely identify,
+  but it gives an idea of how diverse the field is.
+
+** option 2 - % unique
+# of unique rows / # of rows
+
+  0 - 1
+
+  rc[rc==1].sum() / shape[0 ]
+
+  this measures the percent of records you can identify uniquely, but
+  it doesn't provide useful information about a single column within a
+  multi-column grain. It's a good overall/final measure if uniqueness
+  is critical.
+
+strength
+
+   id   type
+   1	a
+   2	a
+   3	a
+   4	a
+   5	a
+   5	a
+
+   I want to see something like id .8, type .2
+   total 6                    norm         norm-1
+   id has 5      5/6 = .83    5/7 = .72    4/5 = .8
+   type has 2    2/6 = .17    2/7 = .28    1/5 = .2
+  
+   id	type
+   1	a
+   1	b
+   2	a
+   2	b
+   3	a
+   3	b
+
+   something like id .6, type .4
+   total 6                   normalized   norm-1
+   id has 3   3/6 = .5        3/5 = .6    2/3 = .66
+   type has 2 2/6 = .3333     2/5 = .4    1/3 = .33
+
