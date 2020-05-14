@@ -3,8 +3,8 @@ import sys
 import unittest
 
 import unittest_dfx
-import datasets
-import dfx
+import dfx.datasets as datasets
+import dfx.grain as dfx
 
 class TestGrainFind(unittest_dfx.AbstractDfTestCase):
     """Test methods for identifying the columns in a dataset
