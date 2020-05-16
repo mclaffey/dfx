@@ -439,12 +439,13 @@ class FlagNullColumn(object):
 class NumericNormalColumn(object):
     """Test for normality
     """
-    label='num normal'
+    label='num_normal'
     
     def __init__(self, col, max_pvalue=.05):
         self.applies = False
         self.col = col
         self._disqual = []
+        self.details = ''
 
         import scipy.stats
         import warnings
@@ -453,13 +454,15 @@ class NumericNormalColumn(object):
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
             res = scipy.stats.normaltest(col, nan_policy='omit')
-        if res.pvalue >= max_pvalue:
+        self.details = str(res)
+        if res.pvalue < max_pvalue:
             self._disqual.append(
                 f"Failed test, p {res.pvalue:.2f} > "+\
                 f"{max_pvalue}")
             return
         else:
             self.applies=True
+
         
 @_is_col_type
 class NumericLongTailColumn(object):
@@ -603,14 +606,10 @@ class ColTypeDf(object):
     def __init__(self, df):
         self._col_types = {k: col_type(col) for k,col in df.iteritems()}
         
-    @property
-    def summary(self):
+    def __str__(self):
         """For each field, list col types that apply
         """
         s = []
         for col_name, (applies, disqual) in self._col_types.items():
             s.append("{:20s}: {}".format(col_name, ", ".join(applies)))
         return "\n".join(s)
-            
-    def pprint(self):
-        print(self.summary)

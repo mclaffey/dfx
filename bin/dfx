@@ -1,0 +1,68 @@
+#!/usr/bin/env python
+# -*- mode: python -*-
+
+import sys
+import os
+
+# on demand, below
+# import pandas as pd
+
+import dfx.ops
+
+def main(args=None):
+    """Entry point for command line
+    """
+    if not args:
+        args = sys.argv
+
+    this = os.path.basename(args.pop(0))
+
+    usage="""Command line entry for dfx
+
+  > {this:} my_data.csv   # show column types on dataset
+  > {this:}               # this screen""".format(this=this)
+
+    if not args or any([_ in args for _ in ['-h', '-?', 'help']]):
+        print(usage)
+        return
+
+    file_path = args.pop(0)
+    if not os.path.isfile(file_path):
+        return ('The file path you gave me doesnt '
+                'appear to be a file: {}'.format(file_path))
+
+    print('Importing pandas...', end='')
+    import pandas as pd
+    print('importing {}...'.format(file_path), end='')
+    df = pd.read_csv(file_path)
+
+
+    # if arg, take as column filter and subset df
+    if args:
+        col_arg = args.pop(0)
+        col_matches = [col for col in df.columns
+                   if col_arg.lower() in col.lower()]
+        if not col_matches:
+            print('Columns in data set: {}'.format(df.columns))
+            return 'No columns match for {}'.format(col_arg)
+
+        df = df[col_matches]        
+
+
+    # get value patterns
+    print('analyzing...')
+    ct = dfx.ops.ColTypeDf(df)
+
+    
+    # if arg, it's a value pattern id
+    val_pat_arg = args.pop(0)
+    for col_name in ct._col_types:
+        print(col_name)
+        col_patterns = ct._col_types[col_name]
+        for group in col_patterns:
+            for val_pat_name, val_pat in group.items():
+                if val_pat_arg.lower() in val_pat_name.lower():
+                    print(val_pat)
+        
+if __name__=='__main__':
+    sys.exit(main())
