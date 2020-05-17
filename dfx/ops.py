@@ -274,83 +274,129 @@ class DiffDf(object):
         
         return df
 
-_COLUMN_TYPES = []
+# ##################################################################
+#
+# value patterns
 
-def _is_col_type(kls):
-    """Decorator that adds column type classes to the _COLUMN_TYPES
-    list, which is what the col_type() function checks against
+_VALUE_PATTERN_CLASSES = []
+
+def _is_value_pattern(kls):
+    """Decorator that adds value pattern classes to the _VALUE_PATTERN_CLASSES
+    list, which is what the value_patterns() function checks against
     """
-    _COLUMN_TYPES.append(kls)
+    _VALUE_PATTERN_CLASSES.append(kls)
     return kls
 
-@_is_col_type
-class IdColumn(object):
-    """Values aren't null or duplicated
+class AbstractValuePattern(object):
+    """Base class for common value pattern properties
     """
     def __init__(self, col):
-        self.label='id'
-        self.applies = False
         self.col = col
-        self._disqual = []
+        self.disqual = []
+        self.detail = ''
+        self.evaluate()
 
-        if col.isnull().any():
-            self._disqual.append('Null values')
+    @property
+    def applies(self):
+        return len(self.disqual)==0
 
-        if col.duplicated().any():
-            self._disqual.append('Duplicates')
+    def evalute(self):
+        """To be implemented by each subclass.
 
-        if not self._disqual:
-            self.applies = True
+        Evaluates if the column meets the value pattern. If not, this
+        method must add reasons (plain strings) to self.disqual.
 
-@_is_col_type
-class CategoricalColumn(object):
+        When this method returns to __init__(), if self.disqual is
+        still empty, the pattern is assumed to apply.
+        """
+        raise NotImplementedError('Must be implemented by subclass')
+
+    def __str__(self):
+        return "{}, {:20s}, {}{}{}".format(
+            self.col.name,
+            self.label,
+            'applies' if self.applies else 'disqualified',
+            '='+",".join(self.disqual) if self.disqual else '',
+            ', ' + self.detail if self.detail or self.disqual else 'no detail'
+            )
+
+# do not apply @_is_value_pattern to this
+class DummyValuePattern(AbstractValuePattern):
+    """An instance of ValuePattern that stores the required attributes
+    but doesn't have any rule implementation
+    """
+    label='dummy'
+    def evaluate(self):
+        pass
+        
+@_is_value_pattern
+class IdPattern(AbstractValuePattern):
+    """Values aren't null or duplicated
+    """
+    label='id'
+    def evaluate(self):
+        null_count = self.col.isnull().sum()
+        if null_count:
+            self.disqual.append('{} null values'.format(null_count))            
+
+        dup_count = self.col.duplicated().sum()
+        if dup_count:
+            self.disqual.append('{} duplicates'.format(dup_count))
+
+        if not self.disqual:
+            self.detail='All unique, no nulls'
+
+@_is_value_pattern
+class CategoricalPattern(AbstractValuePattern):
     """Values are duplicated more than the specified percentage
     """
-    def __init__(self, col, cat_dup_min=.5):
-        self.label='categorical'
-        self.applies = False
-        self.col = col
-        self._disqual = []
+    label='categorical'
+    cat_dup_min=.5
 
-        dup_rate = col.fillna('magic_na').duplicated().mean()
+    
+    def evaluate(self):
+        cat_dup_min = self.cat_dup_min
+        dup_rate = self.col.fillna('magic_na').duplicated().mean()
+
         if dup_rate < cat_dup_min:
-            self._disqual.append(
-                f"Dup rate {dup_rate} below min {cat_dup_min}")
+            self.disqual.append(
+                "Dup rate {:.0%} below minimum of {:.0%}".format(
+                    dup_rate, cat_dup_min))
+        else:
+            self.detail=(
+                "Applies because dup rate {:.0%} is more "
+                "than threshold of {:.0%}".format(
+                    dup_rate, cat_dup_min))            
+            
 
-        if not self._disqual:
-            self.applies = True
-
-@_is_col_type
-class DateRegularColumn(object):
+@_is_value_pattern
+class DateRegularPattern(AbstractValuePattern):
     """Dates are evenly spaced by number of days or months.
 
     This automatically catches weeks & years (except for leap years)
     """
     label='date regularly spaced'
     
-    def __init__(self, col):
-        self.applies = False
-        self.col = col
-        self._disqual = []
+    def evaluate(self):
 
-        vals = col.dropna().unique()
+        vals = self.col.dropna().unique()
         vals = pd.Series(vals).sort_values()
 
         # check for year
         has_year = vals.apply(lambda x: hasattr(x, 'year'))
         if not has_year.all():
-            self._disqual.append("Not all values have .year")
+            self.disqual.append("Not all values have .year")
             return
         
         # check for month
         has_month = vals.apply(lambda x: hasattr(x, 'month'))
         if not has_month.all():
-            self._disqual.append("Not all values have .month")
+            self.disqual.append("Not all values have .month")
             return
         
         # single value
         if len(vals) == 1:
-            self._disqual.append("Only one value")
+            self.disqual.append("Only one value")
             return
 
         # Check for same number of months between, and they aren't all
@@ -360,112 +406,96 @@ class DateRegularColumn(object):
                            for post,pre
                            in zip(vals[1:], vals[:-1])])
         if len(month_diffs) > 1:
-            self._disqual.append(
+            self.disqual.append(
                 f"Multiple month intervals ({len(month_diffs)})")
         elif month_diffs == set([0]):
-            self._disqual.append(
+            self.disqual.append(
                 "All in same month, not enough info")
         else:
-            self.applies = True
             return
             
         # Same number of days between unique values
         day_diffs = set([post - pre for post,pre \
                          in zip(vals[1:], vals[:-1])])
         if len(day_diffs) == 1:
-            self.applies = True
-            self._disqual = []
+            self.disqual = []
         else:
-            self._disqual.append(
+            self.disqual.append(
                 f"Multiple day intervals ({len(day_diffs)})")
 
-@_is_col_type
-class FlagColumn(object):
+@_is_value_pattern
+class FlagPattern(AbstractValuePattern):
     """Only two values and high rate of duplication
 
     NULLS are ignored
     """
     label='flag'
-    
-    def __init__(self, col, min_dup_rate=.8):
-        self.applies = False
-        self.col = col
-        self._disqual = []
+    min_dup_rate=.8
 
-        vals = col.dropna().unique()
+    def evaluate(self):
+
+        vals = self.col.dropna().unique()
         n = len(vals)
         if n != 2:
-            self._disqual.append(f"Not two values (n={n})")
+            self.disqual.append(f"Not two values (n={n})")
             return
 
-        dup_rate = col.dropna().duplicated().mean()
-        if dup_rate < min_dup_rate:
-            self._disqual.append(
+        dup_rate = self.col.dropna().duplicated().mean()
+        if dup_rate < self.min_dup_rate:
+            self.disqual.append(
                 f"Dup rate {dup_rate:.0%} below threshold "+\
                 f"{min_dup_rate:.0%}")
             return
 
-        # otherwise applies
-        self.applies = True
         
-@_is_col_type
-class FlagNullColumn(object):
+@_is_value_pattern
+class FlagNullPattern(AbstractValuePattern):
     """Only one value, rarely populated, rest are nulls
     """
     label='flag null'
-    
-    def __init__(self, col, min_null_rate=.8):
-        self.applies = False
-        self.col = col
-        self._disqual = []
+    min_null_rate=.8
 
-        null_rate = col.isnull().mean()
-        if null_rate < min_null_rate:
-            self._disqual.append(
-                f"Null rate {null_rate:.0%} below threshold "+\
-                f"{min_null_rate:.0%}")
+    def evaluate(self):
+        null_rate = self.col.isnull().mean()
+        if null_rate < self.min_null_rate:
+            self.disqual.append(
+                ("Null rate {:.0%} below threshold "
+                 "{:.0%}").format(
+                     null_rate,
+                     self.min_null_rate))
             return
         
-        vals = col.dropna().unique()
+        vals = self.col.dropna().unique()
         n = len(vals)
         if n != 1:
-            self._disqual.append(f"More than one value (n={n})")
+            self.disqual.append(f"More than one value (n={n})")
             return
-
-        # otherwise applies
-        self.applies = True
         
-@_is_col_type
-class NumericNormalColumn(object):
+@_is_value_pattern
+class NumericNormalPattern(AbstractValuePattern):
     """Test for normality
     """
-    label='num_normal'
+    label='normal'
+    max_pvalue=.05
     
-    def __init__(self, col, max_pvalue=.05):
-        self.applies = False
-        self.col = col
-        self._disqual = []
-        self.details = ''
-
+    def evaluate(self):
         import scipy.stats
         import warnings
         # scipy/stats/stats.py:1535: UserWarning: kurtosistest only
         # valid for n>=20 ... continuing anyway, n=10
         with warnings.catch_warnings():
             warnings.simplefilter('ignore')
-            res = scipy.stats.normaltest(col, nan_policy='omit')
+            res = scipy.stats.normaltest(self.col, nan_policy='omit')
         self.details = str(res)
-        if res.pvalue < max_pvalue:
-            self._disqual.append(
-                f"Failed test, p {res.pvalue:.2f} > "+\
-                f"{max_pvalue}")
-            return
-        else:
-            self.applies=True
-
+        if res.pvalue < self.max_pvalue:
+            self.disqual.append(
+                ("Test indicates not normal, p {:.2f} < "
+                 "{:.2f}").format(
+                     res.pvalue,
+                     self.max_pvalue))
         
-@_is_col_type
-class NumericLongTailColumn(object):
+@_is_value_pattern
+class NumericLongTailPattern(AbstractValuePattern):
     """Test for a long tail
 
     If the KS test says its not dissimilar from any of these
@@ -476,12 +506,9 @@ class NumericLongTailColumn(object):
     
     """
     label='num long tail'
-    
-    def __init__(self, col, max_pvalue=.05):
-        self.applies = False
-        self.col = col
-        self._disqual = []
+    max_pvalue=.05
 
+    def evaluate(self):
         from scipy import stats
         import warnings
         # scipy/stats/stats.py:1535: UserWarning: kurtosistest only
@@ -490,18 +517,20 @@ class NumericLongTailColumn(object):
             with warnings.catch_warnings():
                 warnings.simplefilter('ignore')
                 res = stats.kstest(
-                    col, distro,
-                    getattr(stats, distro).fit(col))
-            if res.pvalue > max_pvalue:
-                self._disqual = []
-                self.applies = True
+                    self.col, distro,
+                    getattr(stats, distro).fit(self.col))
+            if res.pvalue > self.max_pvalue:
+                # if any test fail to reject null hypothesis, clear
+                # out any disqualifications from any previous tests
+                # and return (forcing applies=True)
+                self.disqual = []
                 return
             else:
-                self._disqual.append(
+                self.disqual.append(
                     f"Not {distro}, p={res.pvalue:.2f}")
                     
-@_is_col_type
-class NumericAccountingColumn(object):
+@_is_value_pattern
+class NumericMultiscalePattern(AbstractValuePattern):
     """Test for a values at all different scales of 10x
 
     Applies if there are at least three different scales of 10x, such
@@ -512,41 +541,39 @@ class NumericAccountingColumn(object):
 
     Ignores nulls
     """
-    label='num accounting'
+    label='multi_scale'
+    min_scale_count = 3
     
-    def __init__(self, col, max_pvalue=.05):
-        self.applies = False
-        self.col = col
-        self._disqual = []
-
-        vals = col.dropna().unique()
+    def evaluate(self):
+        vals = self.col.dropna().unique()
         import math
+        # determine number of digits
         f = lambda x: int(math.log10(x)) if x != 0 else 0
-        vals = set([f(_) for _ in vals])
-        self._disqual = f'len {len(vals)}'
-        if len(vals) >= 3:
-            self.applies = True
-        else:
-            self._disqual = 'Only {} levels of 10x ({})'.format(
-                len(vals), vals)
+        digit_counts = set([f(_) for _ in vals])
+        self.details = 'Log10 scales that exist: {}'.format(
+            digit_counts)
+        if len(digit_counts) < self.min_scale_count:
+            self.disqual = 'Only {} levels of 10x ({})'.format(
+                len(digit_counts), digit_counts)
 
             
-@_is_col_type
-class TextColumn(object):
+@_is_value_pattern
+class TextPattern(AbstractValuePattern):
     """Criteria:
       - strings
       - few repeated values (not categorical)
       - strings are more than 20 characters
     """
     label='text'
-    
-    def __init__(self, col, str_len_min=20, cat_dup_max=.5):
+    str_len_min=20
+    cat_dup_max=.5
 
-        self._disqual = []
+    def evaluate(self):
+        col = self.col
 
         # check for str attribute
         if not hasattr(col, 'str'):
-            self._disqual.append("Doesn't have str attribute")
+            self.disqual.append("Doesn't have str attribute")
             return
 
         # copy and remove nulls
@@ -556,60 +583,94 @@ class TextColumn(object):
         col_classes= [_ for _ in
                       col.apply(lambda x: type(x).__name__).unique()]
         if col_classes != ['str']:
-            self._disqual.append(
-                f"Non-string class: {col_classes}")
+            self.disqual.append(
+                "Non-string class: {}".format(col_classes))
 
         # check duplication rate
         dup_rate = col.duplicated().mean()
-        if dup_rate > cat_dup_max:
-            self._disqual.append(
-                f"Dup rate {dup_date} above max {cat_dup_max}")
+        if dup_rate > self.cat_dup_max:
+            self.disqual.append(
+                "Dup rate {:.0%} above max {:.0%}".format(
+                    dup_rate,
+                    self.cat_dup_max
+                    ))
 
         # check string length
         mean_str_len = col.str.len().mean()
-        if mean_str_len < str_len_min:
-            self._disqual.append(
-                f"Mean string length {mean_str_len} "+\
-                f"below {str_len_min}")
+        if mean_str_len < self.str_len_min:
+            self.disqual.append(
+                "Mean string length {} below {}".format(                    
+                    mean_str_len,
+                    self.str_len_min
+                    ))
 
-    @property
-    def applies(self):
-        return not self._disqual 
-            
-def col_type(col, types=_COLUMN_TYPES):
-    """Return all applicable column types for the provided column
+def value_patterns(col, pattern_classes=_VALUE_PATTERN_CLASSES):
+    """Return all applicable value patterns for the column
 
     Returns a tuple of (applies, disqualified), where each
-    are a dictionary with keys of column type labels and values of
-    column type instances.
+    are a dictionary with keys of the value pattern label
+    and values of the value pattern instance.
     """
     applies = {}
     disqual = {}
-    for ct_class in _COLUMN_TYPES:
+    for vp_class in pattern_classes:
         try:
-            ct = ct_class(col)
+            vp = vp_class(col)
         except Exception as e:
-            x = lambda: None
-            x._disqual = e.args
-            disqual[ct_class.label] = x
-            continue
-        if ct.applies:
-            applies[ct.label] = ct
+            #raise e from None
+            vp=DummyValuePattern(col)
+            vp.label   = vp_class.label
+            vp.disqual = e.args
+        if vp.applies:
+            applies[vp.label] = vp
         else:
-            disqual[ct.label] = ct
+            disqual[vp.label] = vp
     return (applies, disqual)
         
-class ColTypeDf(object):
-    """Determine column type for all columns in a dataframe and
+class ValuePatternsDf(object):
+    """Determine value pattern for all columns in a dataframe and
     provide text summary, one column per line
+
+    This is a convenience class for calling value_pattern()
+    and displaying the results.    
     """
-    def __init__(self, df):
-        self._col_types = {k: col_type(col) for k,col in df.iteritems()}
+    def __init__(self, df, display=False):
+        """Get value pattern for each column in dataframe
+
+        :df - pandas.DataFrame
+        :display - optional, default False. If true, prints
+           the value patterns of each column as it calculates
+           them        
+        """
+        self.df = df
+        self.value_patterns = {}
+        if display:
+            print("{:20.20s}  {:30.30s} {:20.20s} {:20.20s}".format(
+                'Column',
+                'Value pattern',
+                'First value',
+                'Last value',
+            ))
+            print("{:20.20s}  {:30.30s} {:20.20s} {:20.20s}".format(
+                '------',
+                '-------------',
+                '-----------',
+                '----------',
+            ))
+        for col_name, col in df.iteritems():
+            self.value_patterns[col_name] = value_patterns(col)
+            if display:
+                print("{:20.20s}: {:30.30s} {:20.20s} {:20.20s}".format(
+                    col_name,
+                    ", ".join(self.value_patterns[col_name][0]),
+                    str(col.values[0]),
+                    str(col.values[-1]),
+                ))
         
     def __str__(self):
-        """For each field, list col types that apply
+        """For each field, list value patterns that apply
         """
         s = []
-        for col_name, (applies, disqual) in self._col_types.items():
+        for col_name, (applies, disqual) in self.value_patterns.items():
             s.append("{:20s}: {}".format(col_name, ", ".join(applies)))
         return "\n".join(s)
