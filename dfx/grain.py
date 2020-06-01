@@ -84,14 +84,14 @@ class GrainDf(object):
         
         :columns - list of strings, each string a column name. This is
                    the list that ._find_grain() will search to find
-                   the grain columns. If 'force' is True, this this is
+                   the grain columns. If 'force' is True, this list is
                    used as is for the grain columns, even if not
                    unique.
 
         :force - boolean, default False. If False, _find_grain() will
                    search 'columns' combinations to find those that
                    uniquely identify rows. If force is True, the
-                   'columns' argument will be used the grain columns
+                   'columns' argument will be used as the grain columns
                    without searching.
 
         :uniq_threshold - float, 0-1, default 1. The minimum percent

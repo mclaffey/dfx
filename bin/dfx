@@ -1,7 +1,6 @@
 #!/usr/bin/env python
 
 import sys
-import dfx.__main__
+import dfx
         
-if __name__=='__main__':
-    sys.exit(dfx.__main__.main())
+sys.exit(dfx.main())

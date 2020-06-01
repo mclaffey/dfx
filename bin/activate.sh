@@ -1,3 +1,4 @@
 #!/usr/bin/env bash
 export PYTHONPATH=$PYTHONPATH:/home/mclaffey/dfx/repo
-echo $PYTHONPATH
+export PATH=$PATH:/home/mclaffey/dfx/repo/bin
+

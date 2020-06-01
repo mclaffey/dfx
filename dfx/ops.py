@@ -58,6 +58,13 @@ class ReducedDf(object):
         print(self.summary)
 
     @property
+    def reduced(self):
+        """Return True/False if any constants/null/zeros
+        """
+        return (self.nulls or self.zeros or self.constants)
+        
+
+    @property
     def summary(self):
         """Report fields and values
         """
