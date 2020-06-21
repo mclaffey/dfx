@@ -13,6 +13,8 @@ import threading
 import dfx.ops
 import dfx.grain
 
+TIMEOUT=300
+
 pd = None # import on demand when needed
 def import_pandas():
     global pd
@@ -72,8 +74,13 @@ class Environment(object):
             raise KeyError('File already loaded')
         import_pandas()
         df=pd.read_csv(path)
+        if 'now_number' not in df.columns:
+            df=df.reset_index().rename(
+                columns={'index': 'row_number'})
+            df['row_number'] += 1
         self.dfvs[path]=DfView(df)
         self.current_dfv_name=path
+        self.current_dir=os.path.dirname(path)
 
     def close(self):
         """Shut down DfView threads and save to disk
@@ -150,23 +157,63 @@ class DfView(object):
     def __init__(self, df):
         self.reduced = dfx.ops.ReducedDf(df)
         self.df=self.reduced.df
+
+        """
+        a subset of rows (Pandas dataframe) to be displayed to the
+        user. Updated by generate_preview()        
+        """
+        self.row_preview = None
+
+        ## column settings
+        
         self.col_selected=0
-        self.row_selected=-1
         self.cols_hidden = []
         self.cols_keep_left = []
 
-        # settings
-        self._randomize=False
-        self.mid_i=[]
+        ## row settings
+        """
+        _preview_head_n/_preview_tail_n
+          count of rows from begininning and end of dataframe
+          to be displayed in preview
+        _preview_mid_n
+          count of rows besides head/tails to show
+          
+        """
+        self._preview_head_n = 5
+        self._preview_tail_n = 5
+        self._preview_mid_n = 10
+        self._preview_center_i = int(self.df.shape[0]/2)
 
-    @property
-    def randomize(self):
-        return self._randomize
+        """
+        Which columns to sort by, and ascending/descending
 
-    @randomize.setter
-    def randomize(self, val):
-        self._randomize=val
+        This is a list of tuples, where each tuple is a column name
+        and boolean, with the boolean True for ascending and False
+        for descending. Set by .sort()
+        """
+        self._sort_fields = []
+
+        """
+        Not sure about this design, namely where to store the
+        preference to randomize the row_preview. Rather than storing
+        with DfView, it might be a property of the user environment
+        across all DfViews.
+
+        Regardless, this isn't currently linked to any behavior of
+        DfView; it is up to the calling code to use:
+          if dfv.randomize:
+            dfx.set_preview(random=True)
         
+        """
+        self.randomize=True
+
+        """
+        integer offset of row that user has selected with cursor
+        """
+        self.row_selected=-1
+
+        self.set_preview(randomize=True)
+
     @property
     def grain(self):
         if not hasattr(self, '_grain_comp'):
@@ -205,42 +252,183 @@ class DfView(object):
         column, using the first and last 5 rows
         """
         if not hasattr(self, '_col_width_orig'):
-            df=self.row_preview(mid_max=0)
+            preview_orig = self.row_preview
+            mid_orig = self._preview_mid_n
+            self._preview_mid_n=0
+            df=self.set_preview()
+            self.row_preview=preview_orig
+            self._preview_mid_n=mid_orig
+            
             self._col_widths_orig = {
                 col_name: max([len(str(_)) for _ in col])
                 for col_name, col in df.iteritems()}
         return self._col_widths_orig
 
-    def row_preview(self, mid_max=10):
-        """Return head+tail, and optionally randomize middle rows
+    def sort(self, field, ascending=True, add=False):
+        """Sort the dataframe for display in row_preview
 
-        :mid_max - int. If greater than zero, up to this many rows
-           will be randomly selected to be included. If self.randomize
-           is True, or mid_max is greater than past mid_max, these
-           rows will be newly randomly selected.
+        This method is called for one field at a time. Use add=True
+        to add a second, third, etc sort field.
+
+        :field - string. Name of column to sort by. If None,
+          existing fields are discarded and sort is set to
+          'row_number' ascending.        
+        :ascending - boolean, default True. If True, sort
+          ascending. If False, sort descending.
+        :add - boolean, default False. If False, any existing
+          sort fields will be discarded and new sort is only based
+          on 'field'. If True, 'field' is added as a sort field
+          after any existing fields.
+        """
+        self.randomize=False
+
+        # no sort means sort by row number
+        if field is None:
+            self._sort_fields=[]
+            self.df.sort_values('row_number', inplace=True)
+            self.set_preview()
+            return
+
+        # set self._sort_fields
+        if not add:
+            self._sort_fields = [(field, ascending)]
+        else:
+            # remove if already in it
+            for sort_field in self._sort_fields:
+                if sort_field[0]==field:
+                    self._sort_fields.remove(sort_field)
+                    break
+            self._sort_fields.append((field, ascending))
+
+        # perform sort
+        fields, ascendings = zip(*self._sort_fields)
+        self.df.sort_values(list(fields),
+                            ascending=ascendings,
+                            inplace=True)
+
+        # update preview
+        self.set_preview()
+    
+    def set_preview(self,
+                    center_i=None,
+                    offset=None,
+                    randomize=False,
+    ):
+        """Get a set of rows from the dataframe
+
+        Typically this will be the first few rows, the last few rows,
+        and sample of rows in between. The middle sample can either be
+        set by specifying a row to center on (center_i=), by
+        specifying a number of rows to move up or down (offset=), or
+        by specifying self.randomize=True and a random sample will be
+        selected.
+        
+        If center_i or offset are provided, the relevant rows are
+        set. If these are not provided, the mid rows are selected
+        by random sample.
+
+        Only one of the following can be specified at a time:
+          - center_i
+          - offset
+          - randomize
+        
+        :center_i - int. Optional, a row number. If provided, the
+           mid_rows are selected so that they center on the specified
+           row. First row is 1, not 0.
+        :offset - int, default None. If not None and positive int,
+           shift the middle rows down to show later row numbers. If
+           negative, shift up.
+        :randomize - bool. Default False. If True, middle rows
+           will be randomly sampled from dataframe, but in order.
 
         """
-        head_n=5
-        head_i = list(range(head_n))
-        tail_n=5
-        tail_i = list(range(-tail_n, 0))
-        nrow=self.df.shape[0]
 
-        # if small dataset or not asking for mid, return
+        # check arguments
+        arg_sum = sum([1 if _ else 0 for _ in
+                       [randomize, center_i, offset]])
+        if arg_sum > 1:        
+            raise ValueError(('Can not specify more than one: '+\
+                              'randomize={} '.format(randomize)+\
+                              'center_i={} '.format(center_i)+\
+                              'offset={}'.format(offset)))
+
+        # if offset, call set_preview() again
+        if offset is not None:
+            return self.set_preview(
+                center_i=self._preview_center_i+offset)
+        
+        # calculate some stuff
+        nrow=self.df.shape[0]        # count of df rows
+        head_n=self._preview_head_n
+        tail_n=self._preview_tail_n
+        head_i = list(range(head_n)) # indices of first rows to show
+        tail_i = sorted([nrow - i - 1 for i in range(0, tail_n)])
+        # get count for middle, unless dataframe is smaller than that
+        mid_n = min(self._preview_mid_n, nrow-head_n-tail_n)
+        
+        # if small dataset, return as is
         if nrow <= (head_n+tail_n):
-            return self.df        
-        elif not mid_max:
-            return self.df.iloc[head_i+tail_i]
+            self.row_preview = self.df
+            return self.row_preview
+           
+        # if not asking for middle rows, return head+tail
+        if mid_n <= 0:
+            self.row_preview=self.df.iloc[head_i+tail_i]
+            return self.row_preview
 
-        # if self.randomize, generate a new sample for mid
-        if self.randomize or mid_max > len(self.mid_i):
-            random_n=min(mid_max, nrow-head_n-tail_n)
-            self.mid_i=random.sample(
+        # if no arguments, just refreshing
+        if arg_sum == 0:
+            if self.randomize:
+                randomize=True
+            else:
+                center_i = self._preview_center_i
+
+        # if center_i is being specified, grab rows before/after
+        # it and updated row_selected
+        if center_i is not None:
+            # if more than number of rows, cap to last row
+            if center_i >= nrow:
+                center_i = nrow-1
+            self._preview_center_i=center_i
+            if center_i in head_i:
+                self.row_selected = head_i.index(center_i)
+                return self.row_preview
+            elif center_i in tail_i:
+                self.row_selected = head_n+mid_n+tail_i.index(center_i)-1
+                return self.row_preview
+            elif center_i >= (nrow - mid_n - tail_n):
+                mid_i = list(range(nrow-mid_n-tail_n, nrow))
+                self.row_selected = head_n + mid_i.index(center_i)
+            elif center_i < (head_n + mid_n):
+                mid_i = list(range(head_n, head_n+mid_n))
+                self.row_selected = head_n + mid_i.index(center_i)
+                
+            else:
+                start_i = center_i - int(mid_n/2)
+                mid_i = list(range(
+                    start_i,
+                    start_i + mid_n,
+                ))
+                self.row_selected = head_n + int(mid_n/2)
+
+        # random, grab that many random rows
+        if randomize:
+            mid_i=random.sample(
                 range(head_n, nrow-tail_n),
-                random_n)
+                mid_n)
+            rows_i = sorted(mid_i)
+            # row_selected isn't updated. the rows on the screen will
+            # be changing, but the cursor will stay in the same place
 
-        mid_i = self.mid_i[:mid_max]        
-        return self.df.iloc[head_i + mid_i + tail_i]
+        # use mid_i to set row_preview
+        rows_i = sorted(set(head_i + mid_i + tail_i)) # dedup
+        #try:
+        #    rows_i = set(head_i + mid_i + tail_i) # dedup
+        #except UnboundLocalError as e:
+        #    raise ValueError(center_i, head_i, tail_i, center_i in head_i)
+        rows_i = list(filter(lambda x: 0 <= x < nrow, rows_i)) # cap
+        self.row_preview=self.df.iloc[rows_i]
+        return self.row_preview
 
     @property
     def reduced_short_desc(self):
@@ -267,22 +455,28 @@ def rect(s):
         
 def curses_loop(scr, env):
     key = ''
-    scr.timeout(300)
+    scr.timeout(TIMEOUT)
     find_mode=False
     find_column=None
     find_value=None
+    jump_mode=False
+    jump_value=''
 
     while key != 'q':
 
         dfv=env.dfv
         df=dfv.df
+
+        # row preview
         if find_column:
             col = dfv.df[find_column].apply(str)
             row_i = col.str.contains(find_value, case=False)
-            dfi=dfv.df[row_i]
-            dfi=dfi[:10]
-        else:
-            dfi=dfv.row_preview()
+            dfv.set_preview(center_i=row_i)
+        if dfv.randomize:
+            dfv.set_preview(randomize=True)
+        dfi=dfv.row_preview
+        if dfi is None:
+            raise RuntimeError()
         
         # columns to be displayed
         col_names = dfv.cols_keep_left +\
@@ -353,12 +547,17 @@ def curses_loop(scr, env):
         y+=1
 
         # screen line - key, randomize on, find
-        line='{:10s} {} {}'.format(
+        line='{:15s} {} {} {}'.format(
             key,
             'RANDOMIZE' if dfv.randomize else 'not randomize',
             'Find: {}={}'.format(find_column, find_value),
+            'Jump {}={}'.format(jump_mode, jump_value),
             )
         scr.addstr(y, 0, line)
+        y+=1
+
+        # screen line - sort
+        scr.addstr(y, 0, 'Sort: {}'.format(dfv._sort_fields))
         y+=1
 
         # screen line - reduced
@@ -442,13 +641,34 @@ def curses_loop(scr, env):
         except curses.error:
             key = ''
 
+        # find mode
         if find_mode and key != '':
             if key=='\n':
                 find_mode=False
             else:
                 find_value+=key
             key=''
-            
+
+        # jump mode
+        if jump_mode and key != '':
+            if key=='\n':
+                jump_mode=False
+                jump_value=''
+            if key=='KEY_BACKSPACE':
+                if jump_value:
+                    jump_value=jump_value[:-1]                
+            if key in '0123456789':
+                jump_value+=key
+                
+            key=''                
+            jump_int=None
+            try:
+                jump_int = int(jump_value)
+            except ValueError:
+                pass
+            if jump_int is not None and jump_int != 0:
+                jump_int -= 1
+                dfv.set_preview(center_i=jump_int)
 
         # move around
         if key=='KEY_LEFT':
@@ -462,37 +682,66 @@ def curses_loop(scr, env):
         if key=='KEY_UP':
             dfv.row_selected-=1
 
-        # find
+        # a A - sort ascending
         if key=='a':
-            find_mode=True
-            find_value=''
+            col_name=col_names[dfv.col_selected]
+            dfv.sort(col_name, add=True)
         if key=='A':
-            find_column=None
-            find_value=None
+            col_name=col_names[dfv.col_selected]
+            dfv.sort(col_name, add=False)
             
-        # value counts
+        # c - value counts
         if key=='c':
             vc=df[col_names[dfv.col_selected]].value_counts().head(40)
             s = rect(str(vc))
             scr.erase()
             scr.addstr(3,0,s)
+            scr.timeout(0)
             scr.getkey()
+            scr.timeout(TIMEOUT)
 
-        # load file
+        # d - scroll down
+        if key=='d':
+            dfv.set_preview(offset=1)
+
+        # f F - find
         if key=='f':
-            env.next_file()
-
-        # show GrainDf details
+            find_mode=True
+            find_value=''
+        if key=='F':
+            find_column=None
+            find_value=None
+            
+        # g - show GrainDf details
         if key=='g':
             scr.erase()
             scr.addstr(0,0,dfv.grain.summary)
             scr.getkey()
 
-        # next DfView
+        # h - unhide columns
+        if key=='h':
+            dfv.cols_hidden=[]
+
+        # j - jump to row
+        if key=='j':
+            dfv.randomize=False
+            jump_mode=True
+
+        # l - load file
+        if key=='l':
+            env.next_file()
+
+        # m - toggle randomization
+        if key=='m':
+            dfv.randomize=True
+        if key=='M':
+            dfv.randomize=False
+
+        # n - next DfView
         if key=='n':
             env.next()
 
-        # show ReducedDf details
+        # r- show ReducedDf details
         if key=='r' and dfv.reduced.reduced:
             scr.erase()
             y=0
@@ -513,21 +762,33 @@ def curses_loop(scr, env):
                 y+=1
                 for col in dfv.reduced.nulls:
                     scr.addstr(y, 2, col)
-                    scr.getkey()
+            scr.timeout(0)
+            scr.getkey()
+            scr.timeout(TIMEOUT)
 
-        # unhide columns
+        # u - scroll up
         if key=='u':
-            dfv.cols_hidden=[]
+            dfv.set_preview(offset=-1)
 
-        # show ValuePatternsDf details
+        # v - show ValuePatternsDf details
         if key=='v':
             scr.erase()
             scr.addstr(0,0, str(dfv.value_patterns))
+            scr.timeout(0)
             scr.getkey()
+            scr.timeout(TIMEOUT)
 
-        # toggle randomization
+        # y - remove sort
+        if key=='y':
+            dfv.sort(None)
+
+        # z Z - sort descending
         if key=='z':
-            dfv.randomize=~dfv.randomize
+            col_name=col_names[dfv.col_selected]
+            dfv.sort(col_name, ascending=False, add=True)
+        if key=='Z':
+            col_name=col_names[dfv.col_selected]
+            dfv.sort(col_name, ascending=False, add=False)
 
         # ENTER, filter to value
         if key=='\n':
@@ -535,7 +796,8 @@ def curses_loop(scr, env):
             filter_val=dfi[col_name].values[dfv.row_selected]
             df_filt=df[df[col_name]==filter_val]
             dfv=DfView(df_filt)
-            env.current_dfv_name=env.current_dfv_name + ' > {}={}'.format(col_name, filter_val)
+            env.current_dfv_name=env.current_dfv_name +\
+                ' > {}={}'.format(col_name, filter_val)
             env.dfvs[env.current_dfv_name]=dfv
 
         # hide column
