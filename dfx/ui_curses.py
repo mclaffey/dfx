@@ -35,7 +35,7 @@ class Environment(object):
         # key of current Dfview
         self.current_dfv_name=None
         # directory to look for other csvs
-        self.currend_dir=None
+        self.current_dir=None
 
     @property
     def dfv(self):
@@ -74,10 +74,6 @@ class Environment(object):
             raise KeyError('File already loaded')
         import_pandas()
         df=pd.read_csv(path)
-        if 'now_number' not in df.columns:
-            df=df.reset_index().rename(
-                columns={'index': 'row_number'})
-            df['row_number'] += 1
         self.dfvs[path]=DfView(df)
         self.current_dfv_name=path
         self.current_dir=os.path.dirname(path)
@@ -89,29 +85,65 @@ class Environment(object):
             dfv.close()
         with open('env.pickle', 'wb') as f:
             pickle.dump(self, f)
-        
+
+    def new_dfv(self,
+                df=None,
+                name='',
+                parent_dfv=None):
+        """Add a new DfView to environment and switch to it
+        """
+        self.dfvs[name]=DfView(df,
+                              parent_dfv=parent_dfv)
+        self.current_dfv_name=name        
 
 class IncrementalDfComp(object):
     """Compute a function on the first 10, 100, 1000 rows
     of a dataframe
     """
-    def __init__(self, df, func):
+    def __init__(self, df, func, *args, **kwargs):
+        # attributes passed in to init
         self.df=df
         self.func=func
+        self.args=args
+        self.kwargs=kwargs
+        # attribute calculated by class
         self.results=[]
         self.message='Not started'
         self.done=False
         self._set_nrows()
         self._thread=None
 
+        # start first calculation
+        self.still_needed()
+
     @property
     def result(self):
-        if self.results:
-            return self.results[0]
-        else:
-            return None
+        """Return the output of func() for the largest dataset
+        that has been calculated so far.
+
+        .results() is a list of outputs from func(). They go in order,
+        with the first result having been calculated on the largest
+        number of rows.
+        """
+        # if the first result hasn't been returned yet, wait for it
+        if not self.results:
+            self._thread.join()
+        return self.results[0]
 
     def _set_nrows(self):
+        """Determine the incremental number of rows that each dataset
+        should have when passed to func
+
+        This goes 10, 100, 1000... up to the full number of rows in
+        the dataset. If the second to last value is within 80% of the
+        full dataset, that value is skipped (e.g. if there are 1050
+        rows in the dataset, it will go 10, 100, 1050).
+
+        .nrows is a list which is treated as a queue. A calculation is
+        started on the first row count in the list, and when that
+        calculation is completed, that first row count is popped
+        off. The instance is done calculating when this list is empty.
+        """
         i = 1
         self.nrows=[]
         while True:
@@ -125,6 +157,12 @@ class IncrementalDfComp(object):
     def still_needed(self):
         """Tell the instance to calculate the next longest
         increment if one is available
+
+        The intention is that every time calling code checks the
+        instance for the current result, it would call this method to
+        indicate that it is still interested in a more complete
+        response.
+
         """
         if self.done:
             return
@@ -134,11 +172,20 @@ class IncrementalDfComp(object):
         self._thread.start()
         
     def calc(self):
+        """This is the workhorse method that is executed
+        as a separate thread
+
+        The calling code isn't expected to call this method; it should
+        call .still_needed() and check .done.
+        """
         if not self.nrows:
             raise ValueError('No more nrows')
         nrow=self.nrows[0]
         self.message='Running for {} rows'.format(nrow)
-        self.results.insert(0, self.func(self.df[:nrow]))
+        res = self.func(self.df[:nrow],
+                        *self.args,
+                        **self.kwargs)
+        self.results.insert(0, res)
         self.message='Done with {} rows'.format(nrow)
         self.nrows.remove(nrow)
         if not self.nrows:
@@ -152,11 +199,79 @@ class IncrementalDfComp(object):
         continuing to run in the background.
         """
         self._thread=None
+
+def streak_next(values, i):
+    """Given a list of numbers, skip forward over consecutive streaks
+
+    Used by DfView.find()
+    
+    If i references a value within a consecutive streak, the value
+    returned will be the index of the end of the streak. If i references
+    a value at the end of a streak, the value returned will be the
+    index of the next streak
+    
+    Example:
+        values = [-1, 3, 4, 5, 10, 11]
+        i = 0                 # values[i] =-1
+        i = streak_next(x, i) # values[i] = 3
+        i = streak_next(x, i) # values[i] = 5
+        i = streak_next(x, i) # values[i] = 10
+        i = streak_next(x, i) # values[i] = 11
+    """
+    while i<len(values)-1:
+        i+=1
+        if i == len(values)-1:
+            break
+        prev_val=values[i-1]
+        curr_val=values[i]
+        if curr_val-prev_val>1:
+            break
+        next_val=values[i+1]
+        if next_val-curr_val>1:
+            break
+    return i
+
+def streak_prev(values, i):
+    """Given a list of numbers, skip backwards over consecutive
+    streaks.
+
+    See streak_next(); this works in the opposite direction.
+    """
+    while i>0:
+        i-=1
+        if i == 0:
+            break
+        next_val=values[i+1]
+        curr_val=values[i]
+        if next_val-curr_val>1:
+            break
+        prev_val=values[i-1]
+        if curr_val-prev_val>1:
+            break
+    return i
+
         
 class DfView(object):
-    def __init__(self, df):
+
+    def __init__(self, df, parent_dfv=None):
+
+        # reduce
+        df = self._strip_cols(df)
         self.reduced = dfx.ops.ReducedDf(df)
         self.df=self.reduced.df
+
+        # add row_number and selected
+        self.df=self.df.reset_index().rename(
+            columns={'index': 'row_number'})
+        self.df['row_number'] += 1
+        #self.df['selected']=''
+
+        """
+        parent_dfv is the DfView that this one was derived from
+
+        Created for value counts join filter
+        """
+        self.parent_dfv=parent_dfv
 
         """
         a subset of rows (Pandas dataframe) to be displayed to the
@@ -205,26 +320,172 @@ class DfView(object):
             dfx.set_preview(random=True)
         
         """
-        self.randomize=True
+        self.randomize=False
 
         """
         integer offset of row that user has selected with cursor
+        with .row_preview (this is not a value from self.df.index)
         """
         self.row_selected=-1
 
         self.set_preview(randomize=True)
 
+
+    """Columns added by DfView
+    """
+    _dfv_cols=['row_number']
+
+    def _strip_cols(self, df=None):
+        """Remove row_number and selected columns
+
+        :df - a DataFrame, in case you want to call this on a
+        dataframe different than the instance's dataframe
+        """
+        if df is None: df=self.df
+        cols = [_ for _ in self._dfv_cols
+                if _ in df.columns]
+        return df.drop(columns=cols)
+
+    """Grain computation
+
+    Initially None. The first call to self.grain, this is populated
+    by an instance of IncrementalDfComp(...GrainDf...).
+    
+    """
+    _grain_comp = None
+        
+    """Grain columns, (set)
+
+    Manual specification of grain columns. 
+    
+    If this is None, grain columns will be determined by GrainDf.
+
+    If not None, the user has manually specified columns to use as
+    grain. These columns will be passed to GrainDf.
+    
+    """
+    _grain_columns = None
+        
     @property
     def grain(self):
-        if not hasattr(self, '_grain_comp'):
+        if self._grain_comp is None:
+            df = self._strip_cols()
             self._grain_comp=IncrementalDfComp(
-                self.df, dfx.grain.GrainDf)
+                df,
+                dfx.grain.GrainDf,
+                columns=self._grain_columns,
+                force=bool(self._grain_columns),
+                uniq_threshold=0,
+            )
         self._grain_comp.still_needed()
         return (
             self._grain_comp.result,
             self._grain_comp.done,
             self._grain_comp.message,
             )
+
+    def add_grain_column(self, column):
+        """Force a column to be part of grain definition
+
+        Returns a newly-calculating self.grain
+
+        If _grain_column is None when this is called, and _grain_comp
+        has any columns currently, that's taken as the starting point
+        and 'column' is added. The list is saved as _grain_columns,
+        and then _grain_comp is recalculated.
+
+        """
+        if column not in self.df.columns:
+            raise KeyError("Not a column: '{}'".format(
+                column))
+        if not self._grain_columns:
+            if self._grain_comp is None:
+                self._grain_columns = set()
+            else:
+                self._grain_columns =set(
+                    self._grain_comp.result.columns)
+        
+        if column in self._grain_columns:
+            return
+        self._grain_columns.add(column)
+
+        # recalc grain attributes
+        self._grain_comp = None
+        return self.grain
+
+    def remove_grain_column(self, column):
+        """Force a column to be removed from grain definition
+
+        Returns a newly-calculating self.grain
+
+        If _grain_column is None when this is called, and _grain_comp
+        has any columns currently, that's taken as the starting point
+        and 'column' is removed. The list is saved as _grain_columns,
+        and then _grain_comp is recalculated. If column is not part of
+        _grain_comp's columns, this will still have the effect of
+        converting to manually specified grain column.       
+        """
+        if column not in self.df.columns:
+            raise KeyError("Not a column: '{}'".format(
+                column))
+        if not self._grain_columns:
+            if self._grain_comp is None:
+                raise ValueError('No grain columns currently specified')
+            else:
+                self._grain_columns =set(
+                    self._grain_comp.result.columns)                
+        if column not in self._grain_columns:
+            return
+        self._grain_columns.remove(column)
+
+        # recalc grain attributes
+        self._grain_comp = None
+        return self.grain
+
+    def melt(self):
+        """Melt to grain column        
+        """
+        df=self._strip_cols()
+        return df.melt(id_vars=self.grain[0].columns)
+    
+    def pivot(self, column):
+        """Pivot on a column
+
+        Returns a new dataframe. Does NOT modified the existing
+        DfView.        
+
+        Grain columns stay as columns. The values of the pivoted
+        columns turn into column groups. All remaining non-grain
+        columns are taken as measures for the pivot.
+
+        No aggregation occurs.
+
+        :column - str. column to pivot on
+        """
+        if column not in self.df.columns:
+            raise ValueError("Not a column: '{}'".format(column))
+        id_cols = [_ for _ in self.grain[0].columns
+                   if _!=column and _ not in self._dfv_cols]        
+
+        # check if this will be unique
+        max_cell_n = self.df.groupby(id_cols+[column]).size().max()
+        if max_cell_n > 1:
+            raise ValueError(
+                'There would be more than 1 value per pivoted cell'
+                ' (max {})'.format(max_cell_n))                
+        
+        val_cols = [_ for _ in self.df.columns
+                    if _ not in id_cols+[column]+self._dfv_cols]
+        piv_df = self.df.pivot_table(index=id_cols,
+                                     columns=[column],
+                                     values=val_cols,
+                                     aggfunc='first')            
+        piv_df = piv_df.reset_index()
+        piv_df.columns = ['_'.join([
+            col_lev for col_lev in col if col_lev])
+                          for col in piv_df.columns]
+        return piv_df
+    
 
     @property
     def value_patterns(self):
@@ -251,7 +512,7 @@ class DfView(object):
         """Calculate the maximum string length of values in each
         column, using the first and last 5 rows
         """
-        if not hasattr(self, '_col_width_orig'):
+        if not hasattr(self, '_col_widths_orig'):
             preview_orig = self.row_preview
             mid_orig = self._preview_mid_n
             self._preview_mid_n=0
@@ -260,9 +521,111 @@ class DfView(object):
             self._preview_mid_n=mid_orig
             
             self._col_widths_orig = {
-                col_name: max([len(str(_)) for _ in col])
+                col_name: max([len(str(_)) for _ in col]+\
+                              [len(col_name)])
                 for col_name, col in df.iteritems()}
         return self._col_widths_orig
+
+    _find_str = ''
+    _find_column_name = ''
+    _find_match_row_i = []
+    _find_match_i = None
+
+    @property
+    def find_status(self):
+        """Return a string indicating what was searched for and how
+        many results were found.
+        """
+        if not self._find_str:
+            return 'No find initiated'
+
+        if not self._find_match_row_i:
+            return "Find {}='{}', no matched.".format(
+                self._find_column_name,
+                self._find_str)                
+        
+        return "Find {}='{}', showing {} of {}".format(            
+            self._find_column_name,
+            self._find_str,
+            self._find_match_i + 1,
+            len(self._find_match_row_i))
+
+    def find(self, find_str=None, direction=None, column=None):
+        """Find text in a column
+
+        Returns False if no match, and doesn't update anything
+
+        # find in current column
+        find(find_str='abc', column='col1')
+
+        # repeat find, to right
+        find(direction='right')
+
+        """
+
+        if not find_str and not direction and not column:
+            raise ValueError('Must provide either find_str, direction'
+                             'or column')
+        #if find_str and direction: error?
+        #if find_str and not column: must provide column (for now)
+
+        if column:
+            self._find_column_name=column
+        # if column isn't specified, use first column
+        if not self._find_column_name:
+            self._find_column_name=self.row_preview.columns[0]
+  
+        if find_str:
+            self._find_str=find_str
+            col=self.df[self._find_column_name].apply(str).reset_index(drop=True)            
+            row_i=col.str.contains(self._find_str, case=False)
+            if not row_i.any():
+                self._find_match_row_i=[]
+                self._find_match_i=None                
+                return False
+            self._find_match_row_i=row_i.index[row_i].array
+            self._find_match_i=0
+
+        if direction=='next':
+            self._find_match_i += 1
+            n = len(self._find_match_row_i)
+            if self._find_match_i == n:
+                self._find_match_i = n-1
+        if direction=='previous':
+            self._find_match_i -= 1
+            if self._find_match_i < 0:
+                self._find_match_i = 0
+        if direction=='down':    
+            self._find_match_i = streak_next(
+                self._find_match_row_i,
+                self._find_match_i)
+        if direction=='up':
+            self._find_match_i = streak_prev(
+                self._find_match_row_i,
+                self._find_match_i)
+        if direction=='left':
+            cols = list(self.row_preview.columns)
+            col_i = cols.index(self._find_column_name)
+            col_i-=1            
+            while col_i >= 0:                
+                new_col = self.df.columns[col_i]
+                if self.find(column=new_col):
+                    break
+                col_i-=1                
+            if col_i<0:
+                return False
+
+        if direction=='right':
+            col_i = self.df.columns.index(self._find_column_name)
+            col_i+=1
+            if col_i > df.shape[1]-1:
+                col_i=df.shape[1]-1
+    
+        # update preview
+        center_i=self._find_match_row_i[self._find_match_i]
+        self.set_preview(center_i=center_i)
+            
+    
 
     def sort(self, field, ascending=True, add=False):
         """Sort the dataframe for display in row_preview
@@ -365,15 +728,22 @@ class DfView(object):
         tail_i = sorted([nrow - i - 1 for i in range(0, tail_n)])
         # get count for middle, unless dataframe is smaller than that
         mid_n = min(self._preview_mid_n, nrow-head_n-tail_n)
+
+        # arrange columns
+        show_cols = self.cols_keep_left +\
+                    [_ for _ in self.df.columns
+                     if _ not in self.cols_hidden 
+                     and _ not in self.cols_keep_left]
+        df = self.df[show_cols]
         
         # if small dataset, return as is
         if nrow <= (head_n+tail_n):
-            self.row_preview = self.df
+            self.row_preview = df
             return self.row_preview
            
         # if not asking for middle rows, return head+tail
         if mid_n <= 0:
-            self.row_preview=self.df.iloc[head_i+tail_i]
+            self.row_preview=df.iloc[head_i+tail_i]
             return self.row_preview
 
         # if no arguments, just refreshing
@@ -427,7 +797,7 @@ class DfView(object):
         #except UnboundLocalError as e:
         #    raise ValueError(center_i, head_i, tail_i, center_i in head_i)
         rows_i = list(filter(lambda x: 0 <= x < nrow, rows_i)) # cap
-        self.row_preview=self.df.iloc[rows_i]
+        self.row_preview=df.iloc[rows_i]
         return self.row_preview
 
     @property
@@ -440,7 +810,7 @@ class DfView(object):
 
         if self.reduced.constants:            
             s += 'Constants: ' + ",".join([
-                '{}={:30.30s}'.format(k,v)
+                '{}={:30.30s}'.format(k,str(v))
                 for k,v in self.reduced.constants.items()])
         if self.reduced.zeros:
             s += " Zeros: " + ",".join(self.reduced.zeros)
@@ -457,10 +827,10 @@ def curses_loop(scr, env):
     key = ''
     scr.timeout(TIMEOUT)
     find_mode=False
-    find_column=None
     find_value=None
     jump_mode=False
     jump_value=''
+    message=''
 
     while key != 'q':
 
@@ -468,21 +838,13 @@ def curses_loop(scr, env):
         df=dfv.df
 
         # row preview
-        if find_column:
-            col = dfv.df[find_column].apply(str)
-            row_i = col.str.contains(find_value, case=False)
-            dfv.set_preview(center_i=row_i)
         if dfv.randomize:
             dfv.set_preview(randomize=True)
         dfi=dfv.row_preview
-        if dfi is None:
-            raise RuntimeError()
         
         # columns to be displayed
-        col_names = dfv.cols_keep_left +\
-                    [_ for _ in df.columns
-                     if _ not in dfv.cols_hidden 
-                     and _ not in dfv.cols_keep_left]
+        col_names = dfi.columns
+        curr_column_name = col_names[dfv.col_selected]
             
         ### calculate column widths
         x_max = 140  # width of screen
@@ -526,8 +888,11 @@ def curses_loop(scr, env):
             col_footers = {_: ['']*col_foot_rows for _ in col_names}
         else:
             for col_name in col_names:
-                vp = vp_result.value_patterns[col_name][0]
-                vp_str = ", ".join(vp.keys())
+                if col_name in vp_result.value_patterns:
+                    vp = vp_result.value_patterns[col_name][0]                    
+                    vp_str = ", ".join(vp.keys())
+                else:
+                    vp_str='NA'
                 col_foot_strs = textwrap.wrap(vp_str,
                                               width=col_widths[col_name])
                 col_foot_strs = col_foot_strs[:col_foot_rows]
@@ -546,16 +911,29 @@ def curses_loop(scr, env):
         scr.addstr(y, 0, line)
         y+=1
 
+        # message
+        scr.addstr(y, 0, message)
+        y+=1
+        
         # screen line - key, randomize on, find
-        line='{:15s} {} {} {}'.format(
+        line='{:15s} {} {}'.format(
             key,
             'RANDOMIZE' if dfv.randomize else 'not randomize',
-            'Find: {}={}'.format(find_column, find_value),
             'Jump {}={}'.format(jump_mode, jump_value),
             )
         scr.addstr(y, 0, line)
         y+=1
 
+        # find
+        if not find_mode:
+            find_str=''
+        elif find_mode=='edit':
+            find_str='Find: {}_'.format(find_value)
+        else:
+            find_str=dfv.find_status
+        scr.addstr(y, 0, find_str)
+        y+=1
+            
         # screen line - sort
         scr.addstr(y, 0, 'Sort: {}'.format(dfv._sort_fields))
         y+=1
@@ -643,11 +1021,56 @@ def curses_loop(scr, env):
 
         # find mode
         if find_mode and key != '':
-            if key=='\n':
-                find_mode=False
+            if find_mode=='edit':
+                if key=='\n':
+                    if find_value=='':
+                        find_mode=False
+                    else:
+                        find_mode='command'
+                elif key=='KEY_BACKSPACE':
+                    if find_value:
+                        find_value=find_value[:-1]
+                elif key.startswith('KEY_'):
+                    pass    
+                else:
+                    find_value+=key
+                # if there are atleast 3 chars, or user just
+                # hit enter, find
+                if len(find_value) >= 2 or find_mode=='command':
+                    dfv.find(find_str=find_value,
+                             column=curr_column_name)                    
+                    
+            elif find_mode=='command':
+                if key=='n':
+                    dfv.find(direction='next')
+                if key=='p':
+                    dfv.find(direction='previous')
+                if key=='d':
+                    dfv.find(direction='down')
+                if key=='u':
+                    dfv.find(direction='up')
+                if key=='l':
+                    dfv.find(direction='left')
+                if key=='r':
+                    dfv.find(direction='right')
+                if key=='f' or key=='\n':
+                    find_mode='edit'
+                if key=='KEY_BACKSPACE':
+                    find_mode='edit'
+                    if find_value:
+                        find_value=find_value[:-1]
+                    if find_value:
+                        dfv.find(find_str=find_value,
+                             column=curr_column_name)                    
+                
+                if key=='q':
+                    find_mode=False
             else:
-                find_value+=key
-            key=''
+                raise ValueError(
+                    'Bad find mode: {}'.format(find_mode))
+            if key not in ['KEY_UP', 'KEY_DOWN', 'KEY_LEFT',
+                'KEY_RIGHT']:                
+                key=''
 
         # jump mode
         if jump_mode and key != '':
@@ -692,13 +1115,12 @@ def curses_loop(scr, env):
             
         # c - value counts
         if key=='c':
-            vc=df[col_names[dfv.col_selected]].value_counts().head(40)
-            s = rect(str(vc))
-            scr.erase()
-            scr.addstr(3,0,s)
-            scr.timeout(0)
-            scr.getkey()
-            scr.timeout(TIMEOUT)
+            vc_df = df[curr_column_name].value_counts()\
+                                        .to_frame().reset_index()
+            vc_df.columns = [curr_column_name, 'count']
+            env.new_dfv(df=vc_df,
+                        name=env.current_dfv_name + ' > counts',
+                        parent_dfv=dfv)
 
         # d - scroll down
         if key=='d':
@@ -706,14 +1128,17 @@ def curses_loop(scr, env):
 
         # f F - find
         if key=='f':
-            find_mode=True
+            find_mode='edit'
             find_value=''
-        if key=='F':
-            find_column=None
-            find_value=None
-            
-        # g - show GrainDf details
+
+        # g G - add/remove from grain columns
         if key=='g':
+            dfv.add_grain_column(curr_column_name)
+        if key=='G':
+            dfv.remove_grain_column(curr_column_name)
+            
+        # ^g - show GrainDf details
+        if key=='^g':
             scr.erase()
             scr.addstr(0,0,dfv.grain.summary)
             scr.getkey()
@@ -731,17 +1156,35 @@ def curses_loop(scr, env):
         if key=='l':
             env.next_file()
 
-        # m - toggle randomization
         if key=='m':
-            dfv.randomize=True
-        if key=='M':
-            dfv.randomize=False
+            new_df = dfv.melt()
+            new_dfv=DfView(new_df)
+            new_dfv_name=env.current_dfv_name +\
+                          ' > melt'
+            env.dfvs[new_dfv_name]=new_dfv
+            env.current_dfv_name=new_dfv_name            
 
         # n - next DfView
         if key=='n':
             env.next()
 
-        # r- show ReducedDf details
+        # p - pivot on column
+        if key=='p':
+            piv_col=curr_column_name
+            try:
+                new_df=dfv.pivot(piv_col)
+            except ValueError as e:
+                message=e.args[0]
+                piv_col=None
+                
+            if piv_col:                
+                new_dfv_name = env.current_dfv_name +\
+                               ' > pivot ' + piv_col
+                new_dfv=DfView(new_df)
+                env.dfvs[new_dfv_name] = new_dfv
+                env.current_dfv_name=new_dfv_name
+            
+        # r - show ReducedDf details
         if key=='r' and dfv.reduced.reduced:
             scr.erase()
             y=0
@@ -766,6 +1209,37 @@ def curses_loop(scr, env):
             scr.getkey()
             scr.timeout(TIMEOUT)
 
+        # ^R - toggle randomization
+        if key=='^R':
+            dfv.randomize=not dfv.randomize
+
+        # s - toggle selected
+        if key=='s':
+            if 'selected' not in df:
+                df['selected'] = ''
+                # kludge: force recalc of column widths
+                delattr(dfv, '_col_widths_orig')
+            row_i = dfv.row_preview.index[dfv.row_selected]
+            new_value='x' if df.loc[row_i, 'selected']=='' else ''
+            df.loc[row_i, 'selected']=new_value
+            dfv.set_preview()
+
+        # t - filter selected back to parent
+        if key=='t':
+            par_df=dfv.parent_dfv.df
+            df = df[df.selected=='x'].copy()
+            if 'row_number' in df:
+                del df['row_number']
+            if 'count' in df:
+                del df['count']
+            del df['selected']
+            new_df=par_df.merge(df, how='inner')
+            del new_df['row_number']
+            env.new_dfv(df=new_df,
+                        name = ' > multi-filter',
+                        parent_dfv=dfv.parent_dfv
+                        )        
+            
         # u - scroll up
         if key=='u':
             dfv.set_preview(offset=-1)

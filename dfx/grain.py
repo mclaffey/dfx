@@ -158,7 +158,7 @@ class GrainDf(object):
             # single column, single line summary
             if len(self.columns) == 1:
                 self._summary = f"Unique {self.unique_rate:.0%}, " +\
-                                self.columns[0]
+                                next(iter(self.columns))
                 return self._summary
 
             # multi-column summary
