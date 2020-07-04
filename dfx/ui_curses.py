@@ -553,15 +553,30 @@ class DfView(object):
     def find(self, find_str=None, direction=None, column=None):
         """Find text in a column
 
-        Returns False if no match, and doesn't update anything
+        Returns False if no match, and doesn't update
+        anything. Otherwise returns True and updates row_preview.        
 
-        # find in current column
-        find(find_str='abc', column='col1')
+        find in specific column:
+          find(find_str='abc', column='col1')
 
-        # repeat find, to right
-        find(direction='right')
+        repeat same find_str, but in a different column
+          find(column='col23')
+
+        repeat find, looking in columns to the right:
+          find(direction='right')
+
+        find a different string, in the same column that was searched
+          last:
+          find(find_str='xyz')
+
+        reset self.row_preview to whatever the last find was. If the
+        last find wasn't successful, returns False and doesn't update
+        the row_preview.
 
         """
+
+        #print('.find(find_str={}, direction={}, column={}'.format(
+        #    find_str, direction, column))
 
         if not find_str and not direction and not column:
             raise ValueError('Must provide either find_str, direction'
@@ -569,23 +584,41 @@ class DfView(object):
         #if find_str and direction: error?
         #if find_str and not column: must provide column (for now)
 
-        if column:
+        # are we looking in a new column?
+        new_column_for_find=False
+        if column and self._find_column_name!=column:
+            new_column_for_find=True
             self._find_column_name=column
+            
         # if column isn't specified, use first column
         if not self._find_column_name:
             self._find_column_name=self.row_preview.columns[0]
-  
-        if find_str:
+
+        # are we looking for a new string?
+        new_str_for_find=False
+        if find_str and self._find_str!=find_str:
+            new_str_for_find=True            
             self._find_str=find_str
+        #else:
+            #print('not new find_str?', find_str, self._find_str,
+            #find_str=self._find_str)
+
+        # if we have new string or column, execute find
+        if new_column_for_find or new_str_for_find:
             col=self.df[self._find_column_name].apply(str).reset_index(drop=True)            
             row_i=col.str.contains(self._find_str, case=False)
             if not row_i.any():
                 self._find_match_row_i=[]
-                self._find_match_i=None                
+                self._find_match_i=None
+                #print('.find() execute - no matches')
                 return False
             self._find_match_row_i=row_i.index[row_i].array
             self._find_match_i=0
+            #print('.find() execute: {} matches'.format(
+                #len(self._find_match_row_i)))
+            # we'll update self.row_preview at the end of this method
 
+        # direction logic
         if direction=='next':
             self._find_match_i += 1
             n = len(self._find_match_row_i)
@@ -610,20 +643,54 @@ class DfView(object):
             while col_i >= 0:                
                 new_col = self.df.columns[col_i]
                 if self.find(column=new_col):
-                    break
+                    # at this point, the above find command has found
+                    # a match and set the row_preview, so we can
+                    # return True for the match without doing anything
+                    # else
+                    return True
                 col_i-=1                
             if col_i<0:
+                # if we we all the way to the left with no matches,
+                # return False
                 return False
 
         if direction=='right':
-            col_i = self.df.columns.index(self._find_column_name)
+            cols = list(self.row_preview.columns)
+            cols_n = len(cols)
+            col_i = cols.index(self._find_column_name)
             col_i+=1
-            if col_i > df.shape[1]-1:
-                col_i=df.shape[1]-1
-    
+            while col_i < cols_n:
+                new_col = self.df.columns[col_i]
+                if self.find(column=new_col):
+                    # at this point, the above find command has found
+                    # a match and set the row_preview, so we can
+                    # return True for the match without doing anything
+                    # else
+                    return True
+                col_i+=1
+            if col_i >= cols_n:
+                # if we we all the way to the rightwith no matches,
+                # return False
+                return False
+
         # update preview
+        # we could reach this point because either:
+        #   - new find string
+        #   - new find column
+        #   - direction command
+        #print('.find() updating preview')
+
+        # if we are here without any matches, don't update row_preview
+        # and return False
+        if self._find_match_i is None:
+            return False
+
+        # otherwise update row_preview to current find
         center_i=self._find_match_row_i[self._find_match_i]
         self.set_preview(center_i=center_i)
+        self.col_selected=list(self.row_preview.columns).index(
+            self._find_column_name)
+        return True
             
     
 
@@ -1012,6 +1079,32 @@ def curses_loop(scr, env):
             x+=col_w + col_spacer
             if x > x_max:
                 break
+
+        # command footer
+        cmd_ftr="""
+ a A       sort ascending   l         load file                 m         melt                  s         selected on/off
+ z Z       sort descending  g G       add to grain (G=remove)   n         next DfView           t         filter join to parent
+ c         value counts     ^g        grain details             p         add column to pivot   u         scroll up
+ d         scroll down      h         unhide columns            r         reduced detail        v         value patterns
+ f         find             j         jump to row number        ^R        randomize on/off      y         unsort (row_number)
+ <arrows>  move cursor      <enter>   filter to value           <space>   hide column           <         freeze column to left 
+"""
+        if find_mode=='edit':
+            cmd_ftr="""
+<enter>    find
+"""
+        if find_mode=='command':
+            cmd_ftr="""
+ u  skip up   (stay in column)    p  previous  step (will go to previous column)    l  left      search columns to left
+ d  skip down (stay in column)    n  next      step (will go to next column)        r  right     search columns to right  
+
+ f            to edit mode                          q exit
+ <enter>      to edit mode
+ <delete>     to edit mode, delete last char
+"""
+        y+=1
+        scr.addstr(y, 0, cmd_ftr.strip('\n'))
+        y+=1
             
         # get key and navigate
         try:
