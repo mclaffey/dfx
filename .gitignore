@@ -1,3 +1,4 @@
 build/
 dfx.egg-info/
 dist/
+sample_data

@@ -1,5 +1,10 @@
 #!/usr/bin/env python
+"""
+A navigator of tabular data, using a curses terminal display
 
+
+
+"""
 import sys
 import pickle
 import os
@@ -28,6 +33,7 @@ def import_pandas():
 class Environment(object):
     """Holds multiple DfViews and moves between them
     """
+    
     def __init__(self):
         # dict of all DfViews, with keys file names or derived
         # names
@@ -43,6 +49,7 @@ class Environment(object):
 
     def next(self):
         """Cycle to next dfv by alphabetical name
+
         """
         names = sorted(self.dfvs.keys())
         i = names.index(self.current_dfv_name)
@@ -97,37 +104,66 @@ class Environment(object):
         self.current_dfv_name=name        
 
 class IncrementalDfComp(object):
-    """Compute a function on the first 10, 100, 1000 rows
-    of a dataframe
+    """Get fast, incremental results when running a function against a
+    large pandas DataFrame.
+
+    This runs the function against the first 10 rows of the dataframe,
+    then 100 rows, then 1000 rows, etc. until the last iteration
+    includes all rows of the original dataframe.
+
     """
     def __init__(self, df, func, *args, **kwargs):
+        """
+        Args:
+
+          df (pandas.DataFrame) - data to run function against.
+          func (callable) - the function to run, which must take
+          a pandas.DataFrame as the first argument.
+          *args: Variable length argument list to pass to func
+          **kwargs: Arbitrary keyword arguments to pass to func
+        
+        """
         # attributes passed in to init
         self.df=df
         self.func=func
         self.args=args
         self.kwargs=kwargs
+        
         # attribute calculated by class
         self.results=[]
         self.message='Not started'
         self.done=False
-        self._set_nrows()
         self._thread=None
 
-        # start first calculation
-        self.still_needed()
+        self.exception=None
+        """Exception during a call to self.func, if one occurs
+        """
 
+        # calculate number of rows for each calculation
+        self._set_nrows()        
+        
+        # start first calculation
+        self._thread=threading.Thread(target=self._run_calc) 
+        self._thread.start()
+        
     @property
     def result(self):
         """Return the output of func() for the largest dataset
         that has been calculated so far.
 
-        .results() is a list of outputs from func(). They go in order,
-        with the first result having been calculated on the largest
-        number of rows.
+        This is dependent on .results(), whcih is a list of outputs
+        from func(). They go in descending order, with the first
+        result having been calculated on the largest number of rows.
         """
-        # if the first result hasn't been returned yet, wait for it
+
         if not self.results:
-            self._thread.join()
+            return None
+            # TODO this was causing the initial dfx screen to hang too long
+            # if the first result hasn't been returned yet, wait for
+            # it
+            # self._thread.join()
+
+        # return result with most rows
         return self.results[0]
 
     def _set_nrows(self):
@@ -135,24 +171,27 @@ class IncrementalDfComp(object):
         should have when passed to func
 
         This goes 10, 100, 1000... up to the full number of rows in
-        the dataset. If the second to last value is within 80% of the
-        full dataset, that value is skipped (e.g. if there are 1050
-        rows in the dataset, it will go 10, 100, 1050).
+        the dataset. If one of the row counts is more than 50% of the
+        full dataset, that row count is skipped. (e.g. if there are
+        1200 rows in the dataset, it will go 10, 100, 1200).
 
         .nrows is a list which is treated as a queue. A calculation is
         started on the first row count in the list, and when that
         calculation is completed, that first row count is popped
         off. The instance is done calculating when this list is empty.
+
         """
         i = 1
         self.nrows=[]
         while True:
             i *= 10
-            if i < (0.8*self.df.shape[0]):
+            # as long as i is less than 
+            if i < (0.5*self.df.shape[0]):
                 self.nrows.append(i)
             else:
                 self.nrows.append(self.df.shape[0])
                 return
+        raise ValueError(self.nrows)
         
     def still_needed(self):
         """Tell the instance to calculate the next longest
@@ -164,29 +203,43 @@ class IncrementalDfComp(object):
         response.
 
         """
-        if self.done:
+        if self.done or self.exception:
             return
+
+        # if a thread is running now, don't do anything
         if self._thread and self._thread.isAlive():
             return
-        self._thread=threading.Thread(target=self.calc) 
+
+        # if we got here, there's no thread currently running but we haven't
+        # finished all the calculations, so start another calculation
+        self._thread=threading.Thread(target=self._run_calc) 
         self._thread.start()
         
-    def calc(self):
-        """This is the workhorse method that is executed
-        as a separate thread
+    def _run_calc(self):
+        """This is the workhorse method that is executed as a separate thread
 
         The calling code isn't expected to call this method; it should
         call .still_needed() and check .done.
+
         """
         if not self.nrows:
             raise ValueError('No more nrows')
         nrow=self.nrows[0]
         self.message='Running for {} rows'.format(nrow)
-        res = self.func(self.df[:nrow],
-                        *self.args,
-                        **self.kwargs)
-        self.results.insert(0, res)
-        self.message='Done with {} rows'.format(nrow)
+
+        try:
+            res = self.func(self.df[:nrow],
+                            *self.args,
+                            **self.kwargs)
+        except Exception as e:
+            self.exception=e
+        if self.exception:
+            self.message='Exception on {} rows'.format(nrow)
+            self.done=True
+            self._thread=None
+        else:
+            self.results.insert(0, res)
+            self.message='Done with {} rows'.format(nrow)            
         self.nrows.remove(nrow)
         if not self.nrows:
             self.done=True
@@ -252,9 +305,18 @@ def streak_prev(values, i):
 
         
 class DfView(object):
+    """A highly customizable display of a pandas DataFrame
+
+    Args:
+      df (pandas.DataFrame): The dataframe to build a view for
+
+    Keyword Args:
+      parent_dfv (DfView): The DfView that was used as a starting
+      point for creating this DfView.
+    
+    """
 
     def __init__(self, df, parent_dfv=None):
-
         # reduce
         df = self._strip_cols(df)
         self.reduced = dfx.ops.ReducedDf(df)
@@ -266,18 +328,19 @@ class DfView(object):
         self.df['row_number'] += 1
         #self.df['selected']=''
 
-        """
-        parent_dfv is the DfView that this one was derived from
-
-        Created for value counts join filter
-        """
         self.parent_dfv=parent_dfv
+        """The DfView that was used as a starting point for creating this
+        DfView.
+        
+        (Created for value counts join filter)
+        """
 
+        self.row_preview = None
         """
         a subset of rows (Pandas dataframe) to be displayed to the
-        user. Updated by generate_preview()        
+        user. Updated by set_preview()        
         """
-        self.row_preview = None
+
 
         ## column settings
         
@@ -368,6 +431,20 @@ class DfView(object):
         
     @property
     def grain(self):
+        """Get the grain calculation for the underlying data, as well as the
+        status of the incremental calculation.
+        
+        Returns:
+
+          a tuple of `(result, done, message)`, which are properties
+          of :class:`~ui_curses.IncrementalDfComp`.
+
+        The first time this property is requested, it initiates a
+        call to :class:`grain.GrainDf`, using
+        IncrementalDfComp. It saves the reference to the incremental
+        calculation to :attr:`ui_curses.DfView._grain_comp`.
+
+        """
         if self._grain_comp is None:
             df = self._strip_cols()
             self._grain_comp=IncrementalDfComp(
@@ -387,12 +464,21 @@ class DfView(object):
     def add_grain_column(self, column):
         """Force a column to be part of grain definition
 
-        Returns a newly-calculating self.grain
+        Args:
+          column (str): name of column to add to grain
 
-        If _grain_column is None when this is called, and _grain_comp
-        has any columns currently, that's taken as the starting point
-        and 'column' is added. The list is saved as _grain_columns,
-        and then _grain_comp is recalculated.
+        Returns the new value of :func:`ui_curses.DfView.grain`
+
+        This adds `column` to :attribute:DfView._grain_columns and
+        causes :attribute:DfView._grain_comp to be set to None, so
+        that :attribute:DfView.grain will be recalculated the next
+        time it is retrieved.
+
+        If :attribute:DfView._grain_columns is None when this is
+        called, and :attribute:DfView._grain_comp has any columns
+        currently, that's taken as the starting point and `column` is
+        added. The list is saved as _grain_columns, and then
+        _grain_comp is recalculated.
 
         """
         if column not in self.df.columns:
@@ -492,7 +578,6 @@ class DfView(object):
         if not hasattr(self, '_vp_comp'):
             self._vp_comp=IncrementalDfComp(
                 self.df, dfx.ops.ValuePatternsDf)
-        self._vp_comp.still_needed()
         return (
             self._vp_comp.result,
             self._vp_comp.done,
@@ -746,8 +831,8 @@ class DfView(object):
     ):
         """Get a set of rows from the dataframe
 
-        Typically this will be the first few rows, the last few rows,
-        and sample of rows in between. The middle sample can either be
+        Initially this will be the first few rows, the last few rows,
+        and sample of rows in between. The middle rows can either be
         set by specifying a row to center on (center_i=), by
         specifying a number of rows to move up or down (offset=), or
         by specifying self.randomize=True and a random sample will be
@@ -761,15 +846,23 @@ class DfView(object):
           - center_i
           - offset
           - randomize
+
+        Keyword args:
         
-        :center_i - int. Optional, a row number. If provided, the
-           mid_rows are selected so that they center on the specified
-           row. First row is 1, not 0.
-        :offset - int, default None. If not None and positive int,
-           shift the middle rows down to show later row numbers. If
-           negative, shift up.
-        :randomize - bool. Default False. If True, middle rows
-           will be randomly sampled from dataframe, but in order.
+          center_i (int): If provided, the middle rows are selected so
+            that they include the specified row. First row is 0.
+
+          offset (int): If positive, shift DfView.row_selected down
+            that many rows. If this would be outside of the current
+            middle rows, new middle rows are selected. If negative,
+            shift up in rows.
+
+          randomize (bol): If True, middle rows will be randomly
+            sampled from dataframe (but in order).
+
+        Returns (pandas.DataFrame):
+
+          Returns DfView.row_preview.
 
         """
 
@@ -827,19 +920,29 @@ class DfView(object):
             if center_i >= nrow:
                 center_i = nrow-1
             self._preview_center_i=center_i
+            # if center_i is in head rows, just change .row_selected
+            # and don't change row_preview
             if center_i in head_i:
                 self.row_selected = head_i.index(center_i)
                 return self.row_preview
+            # if center_i is in the tail rows, just change .row_selected
+            # and don't change row_preview
             elif center_i in tail_i:
                 self.row_selected = head_n+mid_n+tail_i.index(center_i)-1
                 return self.row_preview
+            # if center_i is close to the end, make the mid rows
+            # the rows immediately before tail rows
             elif center_i >= (nrow - mid_n - tail_n):
                 mid_i = list(range(nrow-mid_n-tail_n, nrow))
                 self.row_selected = head_n + mid_i.index(center_i)
+            # if center_i is close to the beginning, make the mid rows
+            # the rows immediately after head rows
             elif center_i < (head_n + mid_n):
                 mid_i = list(range(head_n, head_n+mid_n))
                 self.row_selected = head_n + mid_i.index(center_i)
-                
+            # otherwise center_i is in the middle, and middle rows
+            # will not be contigous with head or tail rows. Grab mid
+            # rows to that they center on center_id
             else:
                 start_i = center_i - int(mid_n/2)
                 mid_i = list(range(
@@ -1016,16 +1119,21 @@ def curses_loop(scr, env):
         # screen line - grain
         grain_result, grain_done, grain_message = dfv.grain
         if not grain_result:
-            grain_str = grain_message
+            # if no result yet, show message
+            grain_str = 'Grain: {}'.format(grain_message)
         else:
-            if grain_done:
-                grain_message = ''
-            else:
-                grain_message = ' ({})'.format(grain_message)
-            grain_str = 'Grain{}: {}'.format(
-                grain_message,
-                ". ".join(_.strip() for _ in
-                          grain_result.summary.split('\n')).replace('  ', ' '))
+            # if result, build string from result
+            grain_str = ". ".join([
+                _.strip() for _ in grain_result.summary.split('\n')])
+            while '  ' in grain_str:
+                grain_str=grain_str.replace('  ', ' ')
+            # if not done or exception, show message and result so far
+            if not grain_done or 'exception' in grain_message.lower():
+                grain_str='Grain ({}): {}'.format(
+                    grain_message, grain_str)
+            # if done, only show result, no message
+            elif grain_done:
+                grain_str='Grain: {}'.format(grain_str)
         scr.addstr(y, 0, grain_str[:x_max])
         y+=1
 
