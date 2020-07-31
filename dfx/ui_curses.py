@@ -18,6 +18,17 @@ import threading
 import dfx.ops
 import dfx.grain
 
+
+
+
+# TEMP
+def slow_count(df, **kwargs):
+    import time
+    row_count = df.shape[0]
+    for i in range(row_count):
+        time.sleep(.1)    
+
+
 TIMEOUT=300
 
 pd = None # import on demand when needed
@@ -28,6 +39,7 @@ def import_pandas():
     import pandas
     pd = pandas
     pd.options.display.max_colwidth=12
+
 
 
 class Environment(object):
@@ -112,7 +124,9 @@ class IncrementalDfComp(object):
     includes all rows of the original dataframe.
 
     """
-    def __init__(self, df, func, *args, **kwargs):
+    def __init__(self, df, func, *args,
+                 inc_df_comp_exception=False,
+                 **kwargs):
         """
         Args:
 
@@ -121,6 +135,12 @@ class IncrementalDfComp(object):
           a pandas.DataFrame as the first argument.
           *args: Variable length argument list to pass to func
           **kwargs: Arbitrary keyword arguments to pass to func
+
+        Keyword Arguments:
+
+          inc_df_comp_exception (bool) - If False, exception in func
+          is saved to .exception but is not raised. If True, exception
+          is raised. Used for debugging.
         
         """
         # attributes passed in to init
@@ -128,6 +148,16 @@ class IncrementalDfComp(object):
         self.func=func
         self.args=args
         self.kwargs=kwargs
+        self._raise_exception=inc_df_comp_exception
+        """Flag to indicate whether exception should be raised while
+        running self.func within self._run_calc.
+
+        self._run_calc is running func in a separate thread, so the
+        exception will be raised there, which mains it won't terminate
+        the main thread. But it's useful in Jupyter or anywhere that
+        you can still see the stack trace in stderr.
+        """
+
         
         # attribute calculated by class
         self.results=[]
@@ -158,10 +188,6 @@ class IncrementalDfComp(object):
 
         if not self.results:
             return None
-            # TODO this was causing the initial dfx screen to hang too long
-            # if the first result hasn't been returned yet, wait for
-            # it
-            # self._thread.join()
 
         # return result with most rows
         return self.results[0]
@@ -192,7 +218,7 @@ class IncrementalDfComp(object):
                 self.nrows.append(self.df.shape[0])
                 return
         raise ValueError(self.nrows)
-        
+
     def still_needed(self):
         """Tell the instance to calculate the next longest
         increment if one is available
@@ -203,11 +229,8 @@ class IncrementalDfComp(object):
         response.
 
         """
-        if self.done or self.exception:
-            return
-
-        # if a thread is running now, don't do anything
-        if self._thread and self._thread.isAlive():
+        # if done or there's an active thread, nothing to do
+        if self.done or self._thread:
             return
 
         # if we got here, there's no thread currently running but we haven't
@@ -224,26 +247,34 @@ class IncrementalDfComp(object):
         """
         if not self.nrows:
             raise ValueError('No more nrows')
+        
         nrow=self.nrows[0]
         self.message='Running for {} rows'.format(nrow)
 
+        # call the actual function on specified number of rows of
+        # dataframe
         try:
             res = self.func(self.df[:nrow],
                             *self.args,
                             **self.kwargs)
         except Exception as e:
             self.exception=e
+            if self._raise_exception:
+                raise e from None
+
+        # update the state to reflect exception, incrementally done,
+        # or completely done
         if self.exception:
             self.message='Exception on {} rows'.format(nrow)
             self.done=True
-            self._thread=None
         else:
             self.results.insert(0, res)
             self.message='Done with {} rows'.format(nrow)            
         self.nrows.remove(nrow)
         if not self.nrows:
             self.done=True
-            self._thread=None
+            
+        self._thread=None
 
     def cancel(self):
         """TODO I only need this because I'm trying to pickle a
@@ -439,22 +470,26 @@ class DfView(object):
           a tuple of `(result, done, message)`, which are properties
           of :class:`~ui_curses.IncrementalDfComp`.
 
-        The first time this property is requested, it initiates a
-        call to :class:`grain.GrainDf`, using
-        IncrementalDfComp. It saves the reference to the incremental
-        calculation to :attr:`ui_curses.DfView._grain_comp`.
-
         """
+                        
+        # The first time .grain is requested, this method initiates a
+        # call of grain.GrainDf, using IncrementalDfComp. It
+        # saves the reference to the incremental calculation to
+        # self._grain_comp.
         if self._grain_comp is None:
             df = self._strip_cols()
             self._grain_comp=IncrementalDfComp(
                 df,
-                dfx.grain.GrainDf,
+                dfx.grain.GrainDf, # slow_count, #
                 columns=self._grain_columns,
                 force=bool(self._grain_columns),
-                uniq_threshold=0,
+                uniq_threshold=0 if self._grain_columns else 1
             )
+
+        # every time this property is requested, take that as a sign
+        # that IncrementalComp should keep going
         self._grain_comp.still_needed()
+        
         return (
             self._grain_comp.result,
             self._grain_comp.done,
@@ -572,12 +607,22 @@ class DfView(object):
                           for col in piv_df.columns]
         return piv_df
     
+    """Value pattern comp
+
+    Initially None. The first call to self.value_patterns, this is populated
+    by an instance of IncrementalDfComp(...ValuePatternDf...).
+    
+    """
+    _vp_comp = None
 
     @property
     def value_patterns(self):
-        if not hasattr(self, '_vp_comp'):
+        """See grain, this uses IncrementalComp in the same way
+        """
+        if self._vp_comp is None:
             self._vp_comp=IncrementalDfComp(
                 self.df, dfx.ops.ValuePatternsDf)
+        self._vp_comp.still_needed()
         return (
             self._vp_comp.result,
             self._vp_comp.done,
@@ -587,9 +632,9 @@ class DfView(object):
     def close(self):
         """Stop any threads on IncrementalDfComps
         """
-        if hasattr(self, '_grain_comp'):
+        if self._grain_comp is not None:
             self._grain_comp.cancel()
-        if hasattr(self, '_vp_comp'):
+        if self._vp_comp is not None:
             self._vp_comp.cancel()
 
     @property
@@ -995,6 +1040,7 @@ def rect(s):
         
 def curses_loop(scr, env):
     key = ''
+    last_key=''
     scr.timeout(TIMEOUT)
     find_mode=False
     find_value=None
@@ -1054,6 +1100,7 @@ def curses_loop(scr, env):
         col_footers = {}
         col_foot_rows=3
         vp_result, vp_done, vp_message = dfv.value_patterns
+        
         if not vp_result:
             col_footers = {_: ['']*col_foot_rows for _ in col_names}
         else:
@@ -1085,13 +1132,12 @@ def curses_loop(scr, env):
         scr.addstr(y, 0, message)
         y+=1
         
-        # screen line - key, randomize on, find
-        line='{:15s} {} {}'.format(
-            key,
-            'RANDOMIZE' if dfv.randomize else 'not randomize',
-            'Jump {}={}'.format(jump_mode, jump_value),
-            )
-        scr.addstr(y, 0, line)
+        # screen line - key, jump
+        if key:
+            last_key=key
+        scr.addstr(y, 0, "Key: '{}'".format(last_key))
+        #scr.addstr(y, 40, str([ord(_) for _ in last_key]))
+        scr.addstr(y, 20,'Jump {}={}'.format(jump_mode, jump_value))
         y+=1
 
         # find
@@ -1302,9 +1348,12 @@ def curses_loop(scr, env):
             if dfv.col_selected < len(col_names)-1:
                 dfv.col_selected += 1
         if key=='KEY_DOWN':
-            dfv.row_selected+=1
+            if dfv.row_selected < (dfv.row_preview.shape[0])-1:
+                dfv.row_selected+=1
         if key=='KEY_UP':
-            dfv.row_selected-=1
+            if dfv.row_selected > 0:
+                dfv.row_selected-=1
+            
 
         # a A - sort ascending
         if key=='a':
@@ -1411,7 +1460,7 @@ def curses_loop(scr, env):
             scr.timeout(TIMEOUT)
 
         # ^R - toggle randomization
-        if key=='^R':
+        if key==chr(18): # '^R'
             dfv.randomize=not dfv.randomize
 
         # s - toggle selected
