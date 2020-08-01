@@ -5,7 +5,7 @@ with open("README.md", "r") as fh:
 
 setuptools.setup(
     name="dfx",
-    version="0.0.2",
+    version="0.0.4",
     author="Mike Claffey",
     author_email="mikeclaffey@yahoo.com",
     description="Navigate small data",
@@ -19,4 +19,12 @@ setuptools.setup(
         "Operating System :: OS Independent",
     ],
     python_requires='>=3.6',
+
+    # executable
+    entry_points={
+        'console_scripts': [
+            'dfx = dfx.__main__:main',
+        ],
+    }
+
 )

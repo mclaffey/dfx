@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-
+import sys
 import dfx.ui_curses
 
 def main():
