@@ -20,6 +20,10 @@ setuptools.setup(
     ],
     python_requires='>=3.6',
 
+    # to include docs
+    # include_package_data=True, # not used
+    data_files=[('docs', ['docs/*'])],
+
     # executable
     entry_points={
         'console_scripts': [
